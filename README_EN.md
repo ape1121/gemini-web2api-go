@@ -38,7 +38,9 @@ This is not a wrapper around Google's official API ([generativelanguage.googleap
   - image → video: `input_reference` (start frame) as a data/http(s) URL, `{"image_url": …}`, or a multipart file (OpenAI SDK shape)
   - `size` (`1280x720` / `720x1280`) or `aspect_ratio` (`16:9` / `9:16`)
   - `POST /v1/videos/{id}/extend` `{"prompt": "what happens next"}` continues a finished video in its own Gemini conversation (same account) and returns the whole lengthened MP4
-  - failed jobs say why at once: `video_quota_exhausted` (that account's video budget is used up; nothing was generated, resubmit to land on another account) and `video_refused: <Gemini's reply>` (Gemini answered with text instead of a video)
+  - failed jobs say why at once: `video_quota_exhausted` (every account's video budget is used up, see below) and `video_refused: <Gemini's reply>` (Gemini answered with text instead of a video)
+  - video quota routing: an account whose video budget runs out is skipped for new videos until it resets, and a job that lands on one moves to the next account inside the same job. When every account is cooling down, `POST /v1/videos` answers `429` with `code: video_quota_exhausted` and `Retry-After`, and a running job fails with `retry_after=N` (seconds until the first reset)
+  - `GET /admin/api/video-quota` (admin): per-account video usage in the rolling 5-hour window, status and reset time, read from each account's own Gemini history (read-only; Google's own reset time when a refusal carries it, otherwise first video + 5 h)
 - Real incremental streaming for plain chat (requests with `tools`, and `/v1/responses`, are buffered then sent)
 - Bearer token / `x-api-key` auth; the key can be rotated from the panel
 - `usage` computed with tiktoken; `reasoning_tokens` counted separately, not folded

@@ -38,7 +38,9 @@
   - 图生视频：`input_reference`（首帧），可以是 data/http(s) URL、`{"image_url": …}`，或 multipart 文件（OpenAI SDK 的形状）
   - `size`（`1280x720` / `720x1280`）或 `aspect_ratio`（`16:9` / `9:16`）
   - `POST /v1/videos/{id}/extend` `{"prompt": "接下来发生什么"}`：在原视频所在的 Gemini 会话里续写（同一账号），返回加长后的完整 MP4
-  - 失败立即给出原因：`video_quota_exhausted`（该账号视频额度用完，没有生成任何东西，重新提交会落到别的账号）、`video_refused: <Gemini 的回复>`（Gemini 用文字回答而不是生成视频）
+  - 失败立即给出原因：`video_quota_exhausted`（所有账号的视频额度都用完了，见下）、`video_refused: <Gemini 的回复>`（Gemini 用文字回答而不是生成视频）
+  - 视频额度换号：某个账号视频额度用完后，新视频会跳过它直到额度重置；任务落到这样的账号时会在同一个任务里换下一个账号。所有账号都在冷却时，`POST /v1/videos` 直接回 `429`（`code: video_quota_exhausted`，带 `Retry-After`），进行中的任务以 `retry_after=N`（距最早重置的秒数）失败
+  - `GET /admin/api/video-quota`（管理接口）：每个账号滚动 5 小时窗口内的视频用量、状态和重置时间，读取各账号自己的 Gemini 历史（只读；拒绝消息里带 Google 的重置时间时用它，否则按首个视频 + 5 小时估算）
 - 普通对话真流式：上游每出一帧就转发增量（带 `tools` 的请求和 `/v1/responses` 是收完再发）
 - Bearer token / `x-api-key` 鉴权，key 可在面板轮换
 - `usage` 用 tiktoken 算，`reasoning_tokens` 单列不计入 `completion_tokens`

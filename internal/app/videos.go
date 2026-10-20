@@ -140,6 +140,15 @@ func handleCreateVideo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": map[string]string{"message": err.Error(), "type": "invalid_request_error"}})
 		return
 	}
+	// Every account is out of video quota: say so now, with when to come back, instead of
+	// queueing a job that can only fail.
+	if exhausted, reset := videoPoolExhausted(); exhausted {
+		w.Header().Set("Retry-After", fmt.Sprint(retryAfterSeconds(reset)))
+		writeJSON(w, 429, map[string]any{"error": map[string]any{
+			"message": videoPoolExhaustedError(reset), "type": "rate_limit_error", "code": errVideoQuota,
+			"retry_after": retryAfterSeconds(reset)}})
+		return
+	}
 	j := &videoJob{
 		Size:      size,
 		ID:        "video_" + randHex(16),
@@ -209,9 +218,19 @@ func runVideoJobWith(j *videoJob, images []pendingUpload, pin int64, cont *ConvR
 	if j.Size == "720x1280" {
 		mc.VideoAspect = 17
 	}
-	mc.PinAccountID = pin
 	mc.Cont = cont
-	_, _, res, err := callGemini(j.Prompt, j.Prompt, mc, nil, images, nil, nil)
+	var res *StreamResult
+	if pin > 0 {
+		// An extension stays on the account and conversation of its parent; an exhausted
+		// account is still remembered so new videos skip it.
+		mc.PinAccountID = pin
+		_, _, res, err = videoCall(j.Prompt, j.Prompt, mc, nil, images, nil, nil)
+		if err != nil && strings.Contains(err.Error(), errVideoQuota) {
+			markVideoExhausted(pin)
+		}
+	} else {
+		res, err = callOnVideoAccount(j, mc, images)
+	}
 	if res != nil {
 		videoJobsMu.Lock()
 		j.accountID = res.AccountID
@@ -234,6 +253,48 @@ func runVideoJobWith(j *videoJob, images []pendingUpload, pin int64, cont *ConvR
 	a := res.Artifacts[0]
 	recordRequest("videos", j.Model, j.Prompt, "", res, 200, "", false)
 	finishVideoJob(j, a.Data, a.Mime, "")
+}
+
+// videoCall is callGemini for video jobs; tests replace it.
+var videoCall = callGemini
+
+// callOnVideoAccount runs a new video on the least recently used account that is not in
+// its quota cooldown. When that account turns out to be out of video quota (nothing is
+// consumed) or not signed in, the same job moves on to the next account. With no account
+// left it fails with the pool-exhausted error and the earliest reset.
+func callOnVideoAccount(j *videoJob, mc ModelConfig, images []pendingUpload) (*StreamResult, error) {
+	skip := videoCoolingAccounts()
+	var res *StreamResult
+	var err error
+	for tries := len(accountList()); tries > 0; tries-- {
+		acct, ok := pickCookieAccountExcept(skip)
+		if !ok {
+			break
+		}
+		skip[acct.ID] = true
+		mc.PinAccountID = acct.ID
+		_, _, res, err = videoCall(j.Prompt, j.Prompt, mc, nil, images, nil, nil)
+		if err == nil {
+			return res, nil
+		}
+		msg := err.Error()
+		if strings.Contains(msg, errVideoQuota) {
+			markVideoExhausted(acct.ID)
+			logf("[video] %s: 账号 #%d 额度用完，换下一个账号", j.ID, acct.ID)
+			continue
+		}
+		if strings.Contains(msg, "is not signed in") || strings.Contains(msg, "is not available") {
+			continue
+		}
+		return res, err
+	}
+	if exhausted, reset := videoPoolExhausted(); exhausted {
+		return res, fmt.Errorf("%s", videoPoolExhaustedError(reset))
+	}
+	if err == nil {
+		err = fmt.Errorf("no signed-in account is available for video")
+	}
+	return res, err
 }
 
 func finishVideoJob(j *videoJob, mp4 []byte, mime, errStr string) {
