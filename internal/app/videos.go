@@ -11,6 +11,8 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -24,10 +26,21 @@ type videoJob struct {
 	Status    string `json:"status"` // queued | in_progress | completed | failed
 	CreatedAt int64  `json:"created_at"`
 	Prompt    string `json:"prompt,omitempty"`
+	Size      string `json:"size,omitempty"` // "1280x720" (16:9) or "720x1280" (9:16)
 	Error     string `json:"error,omitempty"`
+	// Extension chain: RemixedFrom is the job this one extends (OpenAI Sora field name);
+	// Seconds is the duration of this job's MP4 when known.
+	RemixedFrom string  `json:"remixed_from_video_id,omitempty"`
+	Account     string  `json:"account,omitempty"` // pool account that made it (label)
+	Seconds     float64 `json:"seconds,omitempty"`
 
 	mp4  []byte // 完成后的视频字节，不进 JSON
 	mime string
+
+	// Where the video lives upstream, needed to extend it (same account + conversation).
+	accountID      int64
+	cid, rid, rcid string
+	turn           int // this job's turn index in the conversation (first = 0)
 }
 
 var (
@@ -61,7 +74,34 @@ func handleCreateVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	var fileRef *pendingUpload
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+		// OpenAI SDK shape: videos.create(prompt=..., input_reference=<file>) is multipart.
+		if err := r.ParseMultipartForm(maxImageBytes + 1<<20); err != nil {
+			writeJSON(w, 400, map[string]any{"error": map[string]string{"message": "bad multipart body: " + err.Error()}})
+			return
+		}
+		req = map[string]any{}
+		for k, v := range r.MultipartForm.Value {
+			if len(v) > 0 {
+				req[k] = v[0]
+			}
+		}
+		if f, hdr, err := r.FormFile("input_reference"); err == nil {
+			data, rerr := io.ReadAll(io.LimitReader(f, maxImageBytes+1))
+			f.Close()
+			mime := hdr.Header.Get("Content-Type")
+			if mime == "" || mime == "application/octet-stream" {
+				mime = http.DetectContentType(data)
+			}
+			up, uerr := newMediaUpload(data, mime, 1)
+			if rerr != nil || uerr != nil {
+				writeJSON(w, 400, map[string]any{"error": map[string]string{"message": fmt.Sprintf("input_reference: %v%v", rerr, uerr), "type": "invalid_request_error"}})
+				return
+			}
+			fileRef = &up
+		}
+	} else if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, map[string]any{"error": map[string]string{"message": "bad json body"}})
 		return
 	}
@@ -81,7 +121,27 @@ func handleCreateVideo(w http.ResponseWriter, r *http.Request) {
 			"message": "model must be a video model (gemini-video)", "type": "invalid_request_error"}})
 		return
 	}
+	// Image→video: OpenAI Sora's `input_reference` (start frame). Accepts a data: URL,
+	// an http(s) URL, or {"image_url": "..."} / {"url": "..."}. Materialized now so a
+	// bad image fails the POST (400) instead of a queued job.
+	var images []pendingUpload
+	if fileRef != nil {
+		images = append(images, *fileRef)
+	} else if ref := inputReferenceSrc(req["input_reference"]); ref != "" {
+		img, err := materializeImage(ref, "", 1)
+		if err != nil {
+			writeJSON(w, 400, map[string]any{"error": map[string]string{"message": "input_reference: " + err.Error(), "type": "invalid_request_error"}})
+			return
+		}
+		images = append(images, img)
+	}
+	size, err := videoSize(req)
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"error": map[string]string{"message": err.Error(), "type": "invalid_request_error"}})
+		return
+	}
 	j := &videoJob{
+		Size:      size,
 		ID:        "video_" + randHex(16),
 		Object:    "video",
 		Model:     model,
@@ -90,12 +150,53 @@ func handleCreateVideo(w http.ResponseWriter, r *http.Request) {
 		Prompt:    prompt,
 	}
 	putVideoJob(j)
-	go runVideoJob(j)
+	go runVideoJob(j, images)
 	writeJSON(w, 200, j)
 }
 
+// videoSize maps OpenAI's `size` ("1280x720"/"720x1280") or an `aspect_ratio`
+// ("16:9"/"9:16") onto the two shapes Gemini web can produce. Default 16:9.
+func videoSize(req map[string]any) (string, error) {
+	s, _ := req["size"].(string)
+	if s == "" {
+		s, _ = req["aspect_ratio"].(string)
+	}
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "16:9", "landscape", "1280x720", "1920x1080":
+		return "1280x720", nil
+	case "9:16", "portrait", "720x1280", "1080x1920":
+		return "720x1280", nil
+	}
+	return "", fmt.Errorf("unsupported size %q: use 1280x720 (16:9) or 720x1280 (9:16)", s)
+}
+
+// inputReferenceSrc pulls an image source out of the input_reference field.
+func inputReferenceSrc(v any) string {
+	switch x := v.(type) {
+	case string:
+		return strings.TrimSpace(x)
+	case map[string]any:
+		for _, k := range []string{"image_url", "url", "data"} {
+			if s, ok := x[k].(string); ok && strings.TrimSpace(s) != "" {
+				return strings.TrimSpace(s)
+			}
+			if m, ok := x[k].(map[string]any); ok {
+				if s, ok := m["url"].(string); ok {
+					return strings.TrimSpace(s)
+				}
+			}
+		}
+	}
+	return ""
+}
+
 // runVideoJob 后台跑视频生成，结果写回 job。
-func runVideoJob(j *videoJob) {
+func runVideoJob(j *videoJob, images []pendingUpload) {
+	runVideoJobWith(j, images, 0, nil)
+}
+
+// runVideoJobWith optionally pins the account and continues a conversation turn.
+func runVideoJobWith(j *videoJob, images []pendingUpload, pin int64, cont *ConvRef) {
 	videoJobsMu.Lock()
 	j.Status = "in_progress"
 	videoJobsMu.Unlock()
@@ -105,7 +206,21 @@ func runVideoJob(j *videoJob) {
 		finishVideoJob(j, nil, "", err.Error())
 		return
 	}
-	_, _, res, err := callGemini(j.Prompt, j.Prompt, mc, nil, nil, nil, nil)
+	if j.Size == "720x1280" {
+		mc.VideoAspect = 17
+	}
+	mc.PinAccountID = pin
+	mc.Cont = cont
+	_, _, res, err := callGemini(j.Prompt, j.Prompt, mc, nil, images, nil, nil)
+	if res != nil {
+		videoJobsMu.Lock()
+		j.accountID = res.AccountID
+		j.Account = res.AccountLabel
+		if res.ConvCID != "" {
+			j.cid, j.rid, j.rcid = res.ConvCID, res.ConvRID, res.ConvRCID
+		}
+		videoJobsMu.Unlock()
+	}
 	if err != nil {
 		recordRequest("videos", j.Model, j.Prompt, "", res, 502, err.Error(), false)
 		finishVideoJob(j, nil, "", err.Error())
@@ -134,18 +249,106 @@ func finishVideoJob(j *videoJob, mp4 []byte, mime, errStr string) {
 	if j.mime == "" {
 		j.mime = "video/mp4"
 	}
+	j.Seconds = mp4Duration(mp4)
 	j.Status = "completed"
+}
+
+// handleExtendVideo 处理 POST /v1/videos/{id}/extend: continue a finished video in its
+// own Gemini conversation (like replying "continue…" to the video in the web app).
+// Runs on the same account that made the parent; that account's quota is used.
+func handleExtendVideo(w http.ResponseWriter, r *http.Request, parentID string) {
+	var req map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]any{"error": map[string]string{"message": "bad json body"}})
+		return
+	}
+	prompt, _ := req["prompt"].(string)
+	if strings.TrimSpace(prompt) == "" {
+		writeJSON(w, 400, map[string]any{"error": map[string]string{"message": "missing prompt (describe what happens next)", "type": "invalid_request_error"}})
+		return
+	}
+	// Optional image (same shapes as input_reference) attached to the continuation turn,
+	// e.g. a reference the prompt asks the next part to match.
+	var images []pendingUpload
+	if ref := inputReferenceSrc(req["input_reference"]); ref != "" {
+		img, err := materializeImage(ref, "", 1)
+		if err != nil {
+			writeJSON(w, 400, map[string]any{"error": map[string]string{"message": "input_reference: " + err.Error(), "type": "invalid_request_error"}})
+			return
+		}
+		images = append(images, img)
+	}
+	p := getVideoJob(parentID)
+	if p == nil {
+		writeJSON(w, 404, map[string]any{"error": map[string]string{"message": "video job not found (jobs are kept 2 h in memory)", "type": "not_found"}})
+		return
+	}
+	videoJobsMu.Lock()
+	status, acct, cid, rid, rcid, turn, model, size := p.Status, p.accountID, p.cid, p.rid, p.rcid, p.turn, p.Model, p.Size
+	videoJobsMu.Unlock()
+	if status != "completed" {
+		writeJSON(w, 409, map[string]any{"error": map[string]string{"message": "parent video is " + status + "; only completed videos can be extended", "type": "invalid_request_error"}})
+		return
+	}
+	if acct == 0 || cid == "" || rid == "" || rcid == "" {
+		writeJSON(w, 409, map[string]any{"error": map[string]string{"message": "parent video has no conversation reference to continue", "type": "invalid_request_error"}})
+		return
+	}
+	j := &videoJob{
+		ID:          "video_" + randHex(16),
+		Object:      "video",
+		Model:       model,
+		Status:      "queued",
+		CreatedAt:   time.Now().Unix(),
+		Prompt:      prompt,
+		Size:        size,
+		RemixedFrom: parentID,
+		turn:        turn + 1,
+	}
+	putVideoJob(j)
+	go runVideoJobWith(j, images, acct, &ConvRef{CID: cid, RID: rid, RCID: rcid, Turn: turn + 1})
+	writeJSON(w, 200, j)
+}
+
+// mp4Duration reads mvhd (movie header) duration; 0 if not found.
+func mp4Duration(b []byte) float64 {
+	i := strings.Index(string(b[:min(len(b), 1<<20)]), "mvhd")
+	if i < 0 || i+24 > len(b) {
+		return 0
+	}
+	box := b[i+4:]
+	be32 := func(x []byte) uint64 { return uint64(x[0])<<24 | uint64(x[1])<<16 | uint64(x[2])<<8 | uint64(x[3]) }
+	if box[0] == 1 { // version 1: 64-bit times
+		if len(box) < 32 {
+			return 0
+		}
+		ts := be32(box[20:24])
+		dur := be32(box[24:28])<<32 | be32(box[28:32])
+		if ts == 0 {
+			return 0
+		}
+		return float64(dur) / float64(ts)
+	}
+	ts, dur := be32(box[12:16]), be32(box[16:20])
+	if ts == 0 {
+		return 0
+	}
+	return float64(dur) / float64(ts)
 }
 
 // handleVideoItem 处理 GET /v1/videos/{id} 和 /v1/videos/{id}/content。
 func handleVideoItem(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/v1/videos/")
+	parts := strings.SplitN(rest, "/", 2)
+	id := parts[0]
+	if r.Method == http.MethodPost && len(parts) == 2 && (parts[1] == "extend" || parts[1] == "remix") {
+		handleExtendVideo(w, r, id)
+		return
+	}
 	if r.Method != http.MethodGet {
 		writeJSON(w, 405, map[string]any{"error": map[string]string{"message": "method not allowed"}})
 		return
 	}
-	rest := strings.TrimPrefix(r.URL.Path, "/v1/videos/")
-	parts := strings.SplitN(rest, "/", 2)
-	id := parts[0]
 	j := getVideoJob(id)
 	if j == nil {
 		writeJSON(w, 404, map[string]any{"error": map[string]string{"message": "video job not found", "type": "not_found"}})

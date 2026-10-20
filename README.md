@@ -35,6 +35,10 @@
 **接口**
 - OpenAI 兼容：`/v1/chat/completions`、`/v1/models`、`/v1/responses`
 - `/v1/videos`：OpenAI(Sora) 形状的异步视频生成——`POST` 建任务、`GET /v1/videos/{id}` 轮询、`GET /v1/videos/{id}/content` 下 MP4（要登录态 Pro 号）
+  - 图生视频：`input_reference`（首帧），可以是 data/http(s) URL、`{"image_url": …}`，或 multipart 文件（OpenAI SDK 的形状）
+  - `size`（`1280x720` / `720x1280`）或 `aspect_ratio`（`16:9` / `9:16`）
+  - `POST /v1/videos/{id}/extend` `{"prompt": "接下来发生什么"}`：在原视频所在的 Gemini 会话里续写（同一账号），返回加长后的完整 MP4
+  - 失败立即给出原因：`video_quota_exhausted`（该账号视频额度用完，没有生成任何东西，重新提交会落到别的账号）、`video_refused: <Gemini 的回复>`（Gemini 用文字回答而不是生成视频）
 - 普通对话真流式：上游每出一帧就转发增量（带 `tools` 的请求和 `/v1/responses` 是收完再发）
 - Bearer token / `x-api-key` 鉴权，key 可在面板轮换
 - `usage` 用 tiktoken 算，`reasoning_tokens` 单列不计入 `completion_tokens`

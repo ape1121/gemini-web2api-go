@@ -35,6 +35,10 @@ This is not a wrapper around Google's official API ([generativelanguage.googleap
 **API**
 - OpenAI-compatible: `/v1/chat/completions`, `/v1/models`, `/v1/responses`
 - `/v1/videos`: OpenAI (Sora)-shaped async video generation — `POST` to create, `GET /v1/videos/{id}` to poll, `GET /v1/videos/{id}/content` to download the MP4 (needs a signed-in Pro cookie)
+  - image → video: `input_reference` (start frame) as a data/http(s) URL, `{"image_url": …}`, or a multipart file (OpenAI SDK shape)
+  - `size` (`1280x720` / `720x1280`) or `aspect_ratio` (`16:9` / `9:16`)
+  - `POST /v1/videos/{id}/extend` `{"prompt": "what happens next"}` continues a finished video in its own Gemini conversation (same account) and returns the whole lengthened MP4
+  - failed jobs say why at once: `video_quota_exhausted` (that account's video budget is used up; nothing was generated, resubmit to land on another account) and `video_refused: <Gemini's reply>` (Gemini answered with text instead of a video)
 - Real incremental streaming for plain chat (requests with `tools`, and `/v1/responses`, are buffered then sent)
 - Bearer token / `x-api-key` auth; the key can be rotated from the panel
 - `usage` computed with tiktoken; `reasoning_tokens` counted separately, not folded

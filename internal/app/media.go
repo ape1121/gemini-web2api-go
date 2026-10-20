@@ -127,31 +127,131 @@ func filterDownloadCookies(cookie string) string {
 // 图片和音乐取回路径不同：图片走 lh3 CDN（链在 StreamGenerate 响应里，302 跟随），
 // 音乐/视频走 contribution.usercontent.google.com/download（链在 hNvQHb 历史里，单次
 // 200）。按 tool 分流。
-func fetchMediaArtifacts(tool int, raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime string) ([]MediaArtifact, error) {
+//
+// rid scopes music/video lookup to this request's turn: in a continued conversation
+// (video extension) the history also holds earlier turns' videos, which must not be
+// mistaken for this one. Returns the turn's response-candidate id (rcid) as well,
+// which is needed to continue the conversation again.
+func fetchMediaArtifacts(tool int, raw, cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime string) ([]MediaArtifact, string, error) {
 	if tool == toolImage {
-		return fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime)
+		arts, err := fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime)
+		return arts, "", err
 	}
 	// 音乐几乎立刻就绪，视频要生成几十秒到几分钟，所以视频轮询给足预算。
 	maxPolls, interval := 6, 2*time.Second
 	if tool == toolVideo {
 		maxPolls, interval = 45, 8*time.Second // 约 6 分钟
 	}
-	arts, err := fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime, maxPolls, interval)
+	arts, rcid, err := fetchDownloadArtifacts(cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime, tool, maxPolls, interval)
 	if err != nil {
-		return arts, err
+		return arts, rcid, err
 	}
-	// 视频一次请求 hNvQHb 里会挂多份下载链（疑似 Veo 的多候选/多档编码，含义未严谨证明），
-	// 只留最大的那份，免得客户端一次拿到两个视频。要区分含义得有干净出口再验（见 CLAUDE.md）。
-	if tool == toolVideo && len(arts) > 1 {
-		largest := arts[0]
-		for _, a := range arts[1:] {
-			if len(a.Data) > len(largest.Data) {
-				largest = a
+	// 视频一次请求 hNvQHb 里会挂多份下载链。Measured: one is the bare MP4 and the
+	// other is a protobuf envelope (prompt + the same MP4 + a timestamp string) that is
+	// *larger*, so "keep the largest" handed clients an unplayable file. Prefer real
+	// MP4 bytes; if only envelopes came back, unwrap the MP4 embedded in them.
+	if tool == toolVideo && len(arts) > 0 {
+		arts = []MediaArtifact{pickVideoArtifact(arts)}
+	}
+	return arts, rcid, nil
+}
+
+// errVideoQuota prefixes the error when an account's daily video limit is used up;
+// clients can match it and resubmit (the pool's LRU rotation picks another account).
+const errVideoQuota = "video_quota_exhausted"
+
+// errVideoRefused prefixes the error when Gemini answers with text instead of
+// starting a video (a refusal); resubmitting the same prompt won't help.
+const errVideoRefused = "video_refused"
+
+// isMP4 reports whether b starts with an ISO-BMFF box header ("....ftyp").
+func isMP4(b []byte) bool {
+	return len(b) >= 12 && string(b[4:8]) == "ftyp"
+}
+
+// pickVideoArtifact returns the largest artifact that is a bare MP4; failing that, the
+// largest MP4 found inside a protobuf envelope; failing that, the largest artifact.
+func pickVideoArtifact(arts []MediaArtifact) MediaArtifact {
+	var best *MediaArtifact
+	for i := range arts {
+		a := arts[i]
+		if !isMP4(a.Data) {
+			if inner := mp4InProtobuf(a.Data, 0); inner != nil {
+				a = MediaArtifact{Mime: "video/mp4", Data: inner}
+			} else {
+				continue
 			}
 		}
-		arts = []MediaArtifact{largest}
+		if best == nil || len(a.Data) > len(best.Data) {
+			best = &a
+		}
 	}
-	return arts, nil
+	if best != nil {
+		best.Mime = "video/mp4"
+		return *best
+	}
+	largest := arts[0]
+	for _, a := range arts[1:] {
+		if len(a.Data) > len(largest.Data) {
+			largest = a
+		}
+	}
+	return largest
+}
+
+// mp4InProtobuf walks protobuf length-delimited fields (recursively) and returns the
+// first payload that is an MP4. Returns nil if b doesn't parse as protobuf.
+func mp4InProtobuf(b []byte, depth int) []byte {
+	if depth > 6 {
+		return nil
+	}
+	varint := func(i int) (uint64, int, bool) {
+		var v uint64
+		for s := uint(0); i < len(b) && s < 64; s += 7 {
+			c := b[i]
+			i++
+			v |= uint64(c&0x7f) << s
+			if c < 0x80 {
+				return v, i, true
+			}
+		}
+		return 0, i, false
+	}
+	for i := 0; i < len(b); {
+		key, next, ok := varint(i)
+		if !ok {
+			return nil
+		}
+		i = next
+		switch key & 7 {
+		case 0:
+			if _, i, ok = varint(i); !ok {
+				return nil
+			}
+		case 1:
+			i += 8
+		case 5:
+			i += 4
+		case 2:
+			n, next, ok := varint(i)
+			if !ok || next+int(n) > len(b) || int(n) < 0 {
+				return nil
+			}
+			p := b[next : next+int(n)]
+			i = next + int(n)
+			if isMP4(p) {
+				return p
+			}
+			if len(p) > 1024 {
+				if r := mp4InProtobuf(p, depth+1); r != nil {
+					return r
+				}
+			}
+		default:
+			return nil
+		}
+	}
+	return nil
 }
 
 // fetchImageArtifacts 取回生成的图片。链在 StreamGenerate 响应里就有，抠不到再退回轮询
@@ -208,27 +308,55 @@ func imageFullResURL(u string) string {
 
 // fetchDownloadArtifacts 取回音乐/视频：轮询 hNvQHb 等到 response_data 下载链，再下。
 // gg-dl（lh3）和 temp_data 那两种链是预览用的，只有 response_data 那条能下到真字节。
-func fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime string,
-	maxPolls int, interval time.Duration) ([]MediaArtifact, error) {
+func fetchDownloadArtifacts(cid, rid, cookie, sapisid, xsrf, proxyURL, defaultMime string, tool int,
+	maxPolls int, interval time.Duration) ([]MediaArtifact, string, error) {
 	if cid == "" {
-		return nil, fmt.Errorf("没拿到会话 id，无法定位产物")
+		return nil, "", fmt.Errorf("没拿到会话 id，无法定位产物")
 	}
 	var dlURLs []string
+	rcid := ""
 	for i := 0; i < maxPolls; i++ {
 		if body, err := pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL); err == nil {
+			if rid != "" {
+				// Only this request's turn; skip polls where it hasn't shown up yet.
+				scoped, ok := historyTurn(body, rid)
+				if !ok {
+					time.Sleep(interval)
+					continue
+				}
+				body = scoped
+			}
+			if m := rcidInTurnRe.FindString(body); m != "" {
+				rcid = m
+			}
+			// Text-only refusal: Gemini answered (reply present) but never started the
+			// video tool, e.g. "I'm having a hard time fulfilling your request." Nothing
+			// will ever be generated, so fail now with Gemini's own words.
+			if tool == toolVideo {
+				if reply, ok := turnReplyText(body); ok && !strings.Contains(body, "video_generation") {
+					return nil, rcid, fmt.Errorf("%s: Gemini declined to make this video: %q (rephrase the prompt; real-artist styles, copyrighted lyrics and violent wording are common triggers)", errVideoRefused, truncate(reply, 200))
+				}
+			}
 			if picked := pickResponseDataURLs(collectDownloadURLs(body)); len(picked) > 0 {
 				dlURLs = picked
 				break
 			}
 			// 视频被内容政策拒时 hNvQHb 里是「I can't generate that video」，别干等到超时。
 			if strings.Contains(body, "can't generate that video") {
-				return nil, fmt.Errorf("视频被内容政策拒绝（换个 prompt 再试）")
+				return nil, rcid, fmt.Errorf("视频被内容政策拒绝（换个 prompt 再试）")
+			}
+			// Daily video quota exhausted on this account: the reply is "I can create more
+			// videos as soon as your limit resets" with an internal "out of video generation
+			// quota" status. Nothing will ever arrive, so fail fast instead of polling ~6 min.
+			// Nothing was consumed; the caller can resubmit (LRU picks another account).
+			if strings.Contains(body, "out of video generation quota") || strings.Contains(body, "as soon as your limit resets") {
+				return nil, rcid, fmt.Errorf("%s: this account's video generation limit is used up (resets later); resubmit to use another account", errVideoQuota)
 			}
 		}
 		time.Sleep(interval)
 	}
 	if len(dlURLs) == 0 {
-		return nil, fmt.Errorf("hNvQHb 里没等到可下载的产物链接（response_data）")
+		return nil, rcid, fmt.Errorf("hNvQHb 里没等到可下载的产物链接（response_data）")
 	}
 	var arts []MediaArtifact
 	for _, u := range dlURLs {
@@ -242,13 +370,99 @@ func fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime st
 		}
 		mime, data, err := downloadBytes(u, cookie, proxyURL, defaultMime)
 		if err != nil {
-			return arts, err
+			return arts, rcid, err
 		}
 		if !artifactSeen(arts, data) {
 			arts = append(arts, MediaArtifact{Mime: mime, Data: data})
 		}
 	}
-	return arts, nil
+	return arts, rcid, nil
+}
+
+var rcidInTurnRe = regexp.MustCompile(`rc_[0-9a-f]{8,}`)
+
+// historyTurn returns an hNvQHb-shaped body holding only the turn whose response id
+// is rid (turn[0] = [cid, rid]), so URL/refusal scans can't see other turns.
+func historyTurn(body, rid string) (string, bool) {
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "[[") {
+			continue
+		}
+		var arr []interface{}
+		if json.Unmarshal([]byte(line), &arr) != nil {
+			continue
+		}
+		for _, it := range arr {
+			row, ok := it.([]interface{})
+			if !ok || len(row) < 3 || row[0] != "wrb.fr" {
+				continue
+			}
+			payload, ok := row[2].(string)
+			if !ok {
+				continue
+			}
+			var p []interface{}
+			if json.Unmarshal([]byte(payload), &p) != nil || len(p) == 0 {
+				continue
+			}
+			turns, ok := p[0].([]interface{})
+			if !ok {
+				continue
+			}
+			for _, t := range turns {
+				tl, ok := t.([]interface{})
+				if !ok || len(tl) == 0 {
+					continue
+				}
+				ids, ok := tl[0].([]interface{})
+				if !ok || len(ids) < 2 || ids[1] != rid {
+					continue
+				}
+				one, _ := json.Marshal([]interface{}{[]interface{}{t}})
+				env, _ := json.Marshal([]interface{}{[]interface{}{"wrb.fr", "hNvQHb", string(one)}})
+				return string(env), true
+			}
+		}
+	}
+	return "", false
+}
+
+// turnReplyText returns the model's reply text of the (first) turn in an hNvQHb
+// body: turn[3][0][0][1][0]. ok=false while the reply isn't there yet.
+func turnReplyText(body string) (string, bool) {
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "[[") {
+			continue
+		}
+		var arr []interface{}
+		if json.Unmarshal([]byte(line), &arr) != nil {
+			continue
+		}
+		for _, it := range arr {
+			row, ok := it.([]interface{})
+			if !ok || len(row) < 3 || row[0] != "wrb.fr" {
+				continue
+			}
+			payload, _ := row[2].(string)
+			var p []interface{}
+			if json.Unmarshal([]byte(payload), &p) != nil || len(p) == 0 {
+				continue
+			}
+			at := func(v interface{}, i int) interface{} {
+				if l, ok := v.([]interface{}); ok && i < len(l) {
+					return l[i]
+				}
+				return nil
+			}
+			txt, ok := at(at(at(at(at(at(p[0], 0), 3), 0), 0), 1), 0).(string)
+			if ok && strings.TrimSpace(txt) != "" {
+				return txt, true
+			}
+		}
+	}
+	return "", false
 }
 
 // pollHistoryRaw 调一次 hNvQHb 取会话历史，返回原始响应体。
@@ -282,7 +496,9 @@ func pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL string) (string, error)
 // deleteConversation 删掉 gemini.google.com 上留下的一条会话（#19）。
 //
 // 协议逐字取自抓包：rpc GzXR5e，参数 ["<cid>"]，mode "generic"，带 at=XSRF。
-//   f.req=[[["GzXR5e","[\"c_xxx\"]",null,"generic"]]]&at=<xsrf>
+//
+//	f.req=[[["GzXR5e","[\"c_xxx\"]",null,"generic"]]]&at=<xsrf>
+//
 // 只登录态可用（匿名没有 XSRF、会话也没落到账号里）。best-effort：删失败只记日志，
 // 不影响已经返给客户端的响应。
 func deleteConversation(cid, cookie, sapisid, xsrf, proxyURL string) {

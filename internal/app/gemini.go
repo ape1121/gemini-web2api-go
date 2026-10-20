@@ -76,6 +76,21 @@ type ModelConfig struct {
 	// 用下载 host 认的 cookie 子集下回原始字节，见 media.go。跟登录态绑定：匿名请求
 	// 这个会被静默降级成一句「Are you signed in?」文本。
 	Tool int
+	// VideoAspect is the inner[55] aspect code for video: 16 = 16:9 (default), 17 = 9:16.
+	VideoAspect int
+	// PinAccountID forces the request onto one cookie-pool account (no fallback to
+	// others). Required to continue a conversation, which lives in that account.
+	PinAccountID int64
+	// Cont, when set, sends this request as the next turn of an existing Gemini
+	// conversation (used for video extension: "reply to the video").
+	Cont *ConvRef
+}
+
+// ConvRef identifies the turn to continue: conversation id, the previous turn's
+// response id and response-candidate id, and that turn's index (first turn = 0).
+type ConvRef struct {
+	CID, RID, RCID string
+	Turn           int
 }
 
 // thinkWire 返回思考档线值（填 header 下标15 / inner[80]）：ThinkWire 显式指定优先，
@@ -237,8 +252,10 @@ type StreamResult struct {
 	// 排查"加了 cookie 就大面积失败"时，最需要知道的正是失败那条用的哪个号。
 	AccountID    int64
 	AccountLabel string
-	TTFBMs       int64
-	TotalMs      int64
+	// Conversation ids of this turn (cid, rid, rcid), so a caller can continue it.
+	ConvCID, ConvRID, ConvRCID string
+	TTFBMs                     int64
+	TotalMs                    int64
 	// Artifacts 是媒体模型（生图/音乐）取回的产物原始字节，非媒体模型为空。
 	Artifacts []MediaArtifact
 	// MediaErr 记媒体产物取回失败的原因：生成本身 200 了、但走 hNvQHb / 下载那步挂了。
@@ -361,7 +378,13 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	// #20 匿名优先：不需要登录态能力时不占用 cookie 账号，走匿名省额度（见 anonFirstEligible）。
 	// 带附件（图/视频）时不能走匿名——下面 uploadBytes 那段会因 cookieStr=="" 直接报错。
 	var acct *CookieAccount
-	if !anonFirstEligible(mc, len(pending) > 0) {
+	if mc.PinAccountID > 0 {
+		a := accountByID(mc.PinAccountID)
+		if a == nil || a.Status != "enabled" {
+			return &StreamResult{}, fmt.Errorf("account #%d is not available (deleted or disabled)", mc.PinAccountID)
+		}
+		acct = a
+	} else if !anonFirstEligible(mc, len(pending) > 0) {
 		if a, ok := pickCookieAccount(); ok {
 			acct = a
 		}
@@ -458,9 +481,16 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		markCookieByStatus(acct.ID, 401, err.Error())
 		lastCookieErr = err
 		logf("[cookie] 账号 #%d 不可用，换下一个：%v", acct.ID, err)
-		acct, _ = pickCookieAccountExcept(tried) // 取不到时返回 nil，循环自然结束
+		if mc.PinAccountID > 0 {
+			acct = nil // pinned: never switch to another account mid-conversation
+		} else {
+			acct, _ = pickCookieAccountExcept(tried) // 取不到时返回 nil，循环自然结束
+		}
 	}
 	if lastCookieErr != nil && cookieStr == "" {
+		if mc.PinAccountID > 0 {
+			return attrib(fmt.Errorf("pinned account #%d is not signed in: %w", mc.PinAccountID, lastCookieErr))
+		}
 		if !rtCfg().FallbackAnon {
 			// 默认报错而不是降级：cookie 失效后上游不会拒绝，只是把你当匿名用户，
 			// 纯文本请求照样 200 —— 于是 3.1 Pro 被静默降级成 3.5 Flash-Lite、
@@ -543,6 +573,12 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	inner[11] = 0
 	// 会话内轮次索引；我们每次都是新会话，恒为 0。
 	inner[17] = []interface{}{[]interface{}{0}}
+	if mc.Cont != nil {
+		// Continue an existing conversation: [cid, rid, rcid, null×6, tok26] + turn index
+		// (same shape as conversation.go's multi-turn path).
+		inner[2] = []interface{}{mc.Cont.CID, mc.Cont.RID, mc.Cont.RCID, nil, nil, nil, nil, nil, nil, ""}
+		inner[17] = []interface{}{[]interface{}{mc.Cont.Turn}}
+	}
 	inner[18] = 0
 	inner[27] = 1
 	inner[30] = []interface{}{4}
@@ -553,7 +589,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	// 临时对话（#34）：inner[45]=1 让这条不进账号的会话列表、不入训练。只在有登录
 	// cookie 时发——匿名本就不落账号，发了也没意义且没验过。multi_turn 开着时
 	// temporaryChatEligible 直接为假（两者冲突，见那里）。
-	if temporaryChatEligible() && cookieStr != "" {
+	if temporaryChatEligible() && cookieStr != "" && mc.Tool != toolVideo {
 		inner[45] = 1
 	}
 	inner[53] = 0
@@ -575,7 +611,11 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	}
 	// 视频还要在 inner[55] 指定画幅比例：[[16]]=16:9，[[17]]=9:16（抓包）。
 	if mc.Tool == toolVideo {
-		inner[55] = []interface{}{[]interface{}{16}}
+		aspect := 16
+		if mc.VideoAspect == 17 {
+			aspect = 17
+		}
+		inner[55] = []interface{}{[]interface{}{aspect}}
 	}
 
 	innerJSON, err := json.Marshal(inner)
@@ -697,7 +737,12 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		//
 		// 判据是**有没有内容帧**，不是 BardErrorInfo：正常响应的结束帧里也带错误码
 		// （1096 = 会话未持久化），拿它判错会把每个正常响应都判成失败。
-		if !hasContentFrame(string(raw)) {
+		// Video: Gemini now acks with a keyed-object frame ({"7":["I'm generating your
+		// video…",["video_generation",…]]}) that has no inner[4] text, so hasContentFrame
+		// says "empty" — but the job is already queued upstream. Retrying here generates
+		// one extra video per attempt (burning daily quota). Once a conversation id
+		// exists, treat it as accepted and let fetchMediaArtifacts poll hNvQHb.
+		if !hasContentFrame(string(raw)) && !videoAccepted(mc.Tool, string(raw)) {
 			lastErr = fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(raw))
 			if pickedOK {
 				// 记进代理健康度：1155 跟出口质量强相关（干净出口 60+ 次 0 发生，
@@ -740,9 +785,15 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			case toolVideo:
 				mime = "video/mp4"
 			}
-			arts, aerr := fetchMediaArtifacts(
-				mc.Tool, string(raw), extractConversationID(string(raw)),
+			cid, rid, _, _ := parseConvIDs(string(raw))
+			if cid == "" {
+				cid = extractConversationID(string(raw))
+			}
+			result.ConvCID, result.ConvRID = cid, rid
+			arts, rcid, aerr := fetchMediaArtifacts(
+				mc.Tool, string(raw), cid, rid,
 				cookieStr, sapisid, xsrfToken, proxyURL, mime)
+			result.ConvRCID = rcid
 			if aerr != nil {
 				logf("[media] 取回产物失败: %v", aerr)
 				result.MediaErr = aerr.Error()
@@ -1022,6 +1073,12 @@ func textsInLine(line string) []string {
 		}
 	}
 	return texts
+}
+
+// videoAccepted reports whether a video StreamGenerate response shows the job was
+// queued upstream (a conversation was created), even without a text content frame.
+func videoAccepted(tool int, raw string) bool {
+	return tool == toolVideo && extractConversationID(raw) != ""
 }
 
 // hasContentFrame 判断响应里到底有没有内容帧。
